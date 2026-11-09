@@ -1,0 +1,203 @@
+name: Release Gradle
+
+# 通用 Gradle 发版工作流，供其他仓库以 workflow_call 方式复用。
+# 流程: 读版本号 -> 检查 tag 是否已存在 -> 编译 -> 推 tag -> 建 release
+# 版本号没变（tag 已存在）时静默跳过，不报错，适合每次 push 都触发。
+
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        type: string
+        default: '21'
+      java-distribution:
+        type: string
+        default: 'temurin'
+      gradle-task:
+        type: string
+        default: 'build'
+      gradle-args:
+        type: string
+        default: '--no-daemon --stacktrace'
+      version-file:
+        description: '版本号所在文件，默认 gradle.properties'
+        type: string
+        default: 'gradle.properties'
+      version-key:
+        description: '版本号字段名'
+        type: string
+        default: 'version'
+      version-command:
+        description: '自定义取版本号命令，非空时优先使用'
+        type: string
+        default: ''
+      tag-prefix:
+        description: 'tag 前缀，填 v 则 tag 为 v1.2.0'
+        type: string
+        default: ''
+      artifact-path:
+        description: '要上传的产物 glob，留空自动扫描 build/libs'
+        type: string
+        default: ''
+      artifact-exclude:
+        description: '自动扫描时排除的 glob，逗号分隔'
+        type: string
+        default: '*-test.jar,*-javadoc.jar'
+      project-name:
+        description: 'release 标题用的项目名，留空用仓库名'
+        type: string
+        default: ''
+      working-directory:
+        type: string
+        default: '.'
+      draft:
+        type: boolean
+        default: false
+      prerelease-on-suffix:
+        description: '版本号含 -SNAPSHOT/-rc/-beta/-alpha 时标为 prerelease'
+        type: boolean
+        default: true
+      fetch-depth:
+        type: number
+        default: 0
+    secrets:
+      token:
+        description: '覆盖 GITHUB_TOKEN，可不传'
+        required: false
+    outputs:
+      released:
+        description: "'true' 表示本次真发布了"
+        value: ${{ jobs.release.outputs.released }}
+      version:
+        description: '本次使用的版本号'
+        value: ${{ jobs.release.outputs.version }}
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    outputs:
+      released: ${{ steps.check.outputs.exists == 'false' && steps.gh_release.outcome == 'success' }}
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: ${{ inputs.fetch-depth }}
+          token: ${{ secrets.token || github.token }}
+
+      - name: Read version
+        id: version
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.version-command }}" ]; then
+            VERSION=$(eval "${{ inputs.version-command }}")
+          else
+            if [ ! -f "${{ inputs.version-file }}" ]; then
+              echo "::error::版本文件不存在: ${{ inputs.version-file }}"
+              exit 1
+            fi
+            VERSION=$(grep -E "^${{ inputs.version-key }}=" "${{ inputs.version-file }}" \
+              | head -n1 | cut -d'=' -f2- | tr -d '[:space:]')
+          fi
+          if [ -z "$VERSION" ]; then
+            echo "::error::无法读取版本号"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "读取到版本号: $VERSION"
+
+      - name: Check tag
+        id: check
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag-prefix }}${{ steps.version.outputs.version }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "tag $TAG 已存在，跳过发布"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup JDK
+        if: steps.check.outputs.exists == 'false'
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: ${{ inputs.java-distribution }}
+
+      - name: Setup Gradle
+        if: steps.check.outputs.exists == 'false'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build
+        if: steps.check.outputs.exists == 'false'
+        working-directory: ${{ inputs.working-directory }}
+        run: ./gradlew ${{ inputs.gradle-task }} ${{ inputs.gradle-args }}
+
+      - name: Collect artifacts
+        if: steps.check.outputs.exists == 'false'
+        id: artifacts
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/release-artifacts
+          if [ -n "${{ inputs.artifact-path }}" ]; then
+            for f in ${{ inputs.artifact-path }}; do
+              [ -f "$f" ] || { echo "::error::产物不存在: $f"; exit 1; }
+              cp "$f" /tmp/release-artifacts/
+            done
+          else
+            EXCLUDES="${{ inputs.artifact-exclude }}"
+            shopt -s nullglob
+            found=0
+            for f in build/libs/*.jar; do
+              [ -f "$f" ] || continue
+              skip=false
+              IFS=',' read -ra PATS <<< "$EXCLUDES"
+              for p in "${PATS[@]}"; do
+                case "$(basename "$f")" in $p) skip=true ;; esac
+              done
+              if [ "$skip" = false ]; then
+                cp "$f" /tmp/release-artifacts/
+                found=$((found+1))
+              fi
+            done
+            if [ "$found" -eq 0 ]; then
+              echo "::error::build/libs 下没有符合条件的 jar"
+              ls -l build/libs || true
+              exit 1
+            fi
+          fi
+          echo "待上传产物:"
+          ls -l /tmp/release-artifacts
+
+      - name: Tag and push
+        if: steps.check.outputs.exists == 'false'
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.check.outputs.tag }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "refs/tags/$TAG"
+
+      - name: Create release
+        id: gh_release
+        if: steps.check.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.check.outputs.tag }}
+          name: ${{ inputs.project-name || github.event.repository.name }} ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          draft: ${{ inputs.draft }}
+          prerelease: ${{ inputs.prerelease-on-suffix && contains(steps.version.outputs.version, '-') }}
+          files: /tmp/release-artifacts/*
+          token: ${{ secrets.token || github.token }}
